@@ -32,5 +32,6 @@ jobs:
             echo "No changes detected in hkg_finishers.json."
           else
             git commit -m "chore: automated update of HKG ironman results [skip ci]"
+            git pull --rebase origin main
             git push
           fi
