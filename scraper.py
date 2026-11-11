@@ -7,7 +7,6 @@ from typing import List, Dict, Any
 import requests
 from bs4 import BeautifulSoup
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -28,7 +27,6 @@ HEADERS = {
 }
 
 def load_whitelist() -> List[str]:
-    """Loads a list of athlete names (case-insensitive) to include regardless of flag."""
     if os.path.exists(WHITELIST_FILE):
         try:
             with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
@@ -39,7 +37,6 @@ def load_whitelist() -> List[str]:
     return []
 
 def get_race_links() -> List[Dict[str, str]]:
-    """Fetches all race URLs from the CoachCox race directory."""
     logging.info(f"Fetching race index from {LIST_URL}")
     response = requests.get(LIST_URL, headers=HEADERS, timeout=15)
     if response.status_code != 200:
@@ -49,7 +46,6 @@ def get_race_links() -> List[Dict[str, str]]:
     soup = BeautifulSoup(response.text, "html.parser")
     race_links = []
     
-    # Target links matching the race pattern /imstats/race/{id}/results/ or /imstats/race/{id}/
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"]
         if "/imstats/race/" in href:
@@ -69,14 +65,10 @@ def get_race_links() -> List[Dict[str, str]]:
     return race_links
 
 def parse_race_results(race_info: Dict[str, str], whitelist: List[str]) -> List[Dict[str, Any]]:
-    """Parses individual race result tables for HKG / Hong Kong or Whitelisted athletes."""
     url = race_info["url"]
-    logging.info(f"Scraping: {url}")
-    
     try:
         response = requests.get(url, headers=HEADERS, timeout=15)
         if response.status_code != 200:
-            logging.warning(f"Skipping {url} — HTTP Status {response.status_code}")
             return []
     except Exception as e:
         logging.error(f"Error requesting {url}: {e}")
@@ -84,7 +76,6 @@ def parse_race_results(race_info: Dict[str, str], whitelist: List[str]) -> List[
 
     soup = BeautifulSoup(response.text, "html.parser")
     
-    # Extract Race Name & Year from page title or url
     page_title = soup.find("h1").text.strip() if soup.find("h1") else race_info["name"]
     year_match = re.search(r"\b(19|20)\d{2}\b", page_title) or re.search(r"\b(19|20)\d{2}\b", url)
     race_year = int(year_match.group(0)) if year_match else None
@@ -94,48 +85,35 @@ def parse_race_results(race_info: Dict[str, str], whitelist: List[str]) -> List[
     if not table:
         return []
 
-    headers = [th.text.strip().lower() for th in table.find_all("th")]
-    
-    # Map key column indices dynamically
-    col_map = {}
-    for idx, h in enumerate(headers):
-        if "name" in h or "athlete" in h: col_map["name"] = idx
-        elif "country" in h or "nat" in h or "nation" in h or "flag" in h: col_map["country"] = idx
-        elif "gender" in h or "sex" in h: col_map["gender"] = idx
-        elif "group" in h or "cat" in h or "div" in h or "age" in h: col_map["age_group"] = idx
-        elif "swim" in h: col_map["swim"] = idx
-        elif "bike" in h: col_map["bike"] = idx
-        elif "run" in h: col_map["run"] = idx
-        elif "finish" in h or "total" in h or "time" in h: col_map["total"] = idx
-        elif "overall" in h or "rank" in h: col_map["overall_rank"] = idx
-        elif "division" in h or "div rank" in h: col_map["div_rank"] = idx
+    rows = table.find_all("tr")
+    if not rows:
+        return []
 
-    for row in table.find_all("tr")[1:]:
-        cols = row.find_all(["td", "th"])
-        if len(cols) < 4:
+    for row in rows[1:]:
+        cols = [td.text.strip() for td in row.find_all(["td", "th"])]
+        if len(cols) < 5:
             continue
             
-        def get_val(key):
-            idx = col_map.get(key)
-            return cols[idx].text.strip() if idx is not None and idx < len(cols) else "N/A"
-
-        athlete_name = get_val("name")
-        country = get_val("country")
+        row_text = " ".join(cols).lower()
         
-        is_hkg = country.upper() in ["HKG", "HONG KONG", "HONG KONG, CHINA", "HK"]
+        # Check if row contains HKG / Hong Kong or matches whitelist
+        is_hkg = "hkg" in row_text or "hong kong" in row_text
+        
+        athlete_name = cols[1] if len(cols) > 1 else cols[0]
         is_whitelisted = athlete_name.lower() in whitelist
-        
+
         if is_hkg or is_whitelisted:
+            # Fallback parsing assuming standard column structures (Name, Gender, Div, Swim, Bike, Run, Total, Rank)
             results.append({
                 "athlete_name": athlete_name,
-                "gender": get_val("gender"),
-                "age_group": get_val("age_group"),
-                "swim_time": get_val("swim"),
-                "bike_time": get_val("bike"),
-                "run_time": get_val("run"),
-                "total_time": get_val("total"),
-                "overall_rank": get_val("overall_rank"),
-                "div_rank": get_val("div_rank"),
+                "gender": cols[2] if len(cols) > 2 else "N/A",
+                "age_group": cols[3] if len(cols) > 3 else "N/A",
+                "swim_time": cols[4] if len(cols) > 4 else "N/A",
+                "bike_time": cols[5] if len(cols) > 5 else "N/A",
+                "run_time": cols[6] if len(cols) > 6 else "N/A",
+                "total_time": cols[7] if len(cols) > 7 else cols[-1],
+                "overall_rank": "N/A",
+                "div_rank": "N/A",
                 "race_name": page_title,
                 "race_year": race_year,
                 "source_url": url
@@ -154,7 +132,6 @@ def main():
         all_finishers.extend(race_results)
         time.sleep(REQUEST_DELAY)
 
-    # Deduplicate based on Athlete Name + Race Name + Total Time
     deduped = {}
     for entry in all_finishers:
         key = f"{entry['athlete_name']}_{entry['race_name']}_{entry['total_time']}".lower()
