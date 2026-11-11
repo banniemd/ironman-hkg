@@ -2,10 +2,7 @@ import os
 import json
 import time
 import logging
-import re
-from typing import List, Dict, Any
 import requests
-from bs4 import BeautifulSoup
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,20 +10,21 @@ logging.basicConfig(
 )
 
 BASE_URL = "https://www.coachcox.co.uk"
-LIST_URL = f"{BASE_URL}/imstats/races/"
 OUTPUT_FILE = "hkg_finishers.json"
 WHITELIST_FILE = "whitelist.json"
-REQUEST_DELAY = 1.5
+REQUEST_DELAY = 1.0
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest"
 }
 
-def load_whitelist() -> List[str]:
+def load_whitelist():
     if os.path.exists(WHITELIST_FILE):
         try:
             with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
@@ -36,117 +34,77 @@ def load_whitelist() -> List[str]:
             logging.warning(f"Could not read {WHITELIST_FILE}: {e}")
     return []
 
-def get_race_links() -> List[Dict[str, str]]:
-    logging.info(f"Fetching race index from {LIST_URL}")
-    try:
-        response = requests.get(LIST_URL, headers=HEADERS, timeout=20)
-        if response.status_code != 200:
-            logging.error(f"Failed to fetch race list. Status: {response.status_code}")
-            return []
-    except Exception as e:
-        logging.error(f"Error connecting to race list: {e}")
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    race_links = []
-    
-    for anchor in soup.find_all("a", href=True):
-        href = anchor["href"]
-        if "/imstats/race/" in href:
-            clean_href = href.split("?")[0]
-            if not clean_href.endswith("/results/"):
-                clean_href = clean_href.rstrip("/") + "/results/"
-            
-            full_url = BASE_URL + clean_href if clean_href.startswith("/") else clean_href
-            if full_url not in [r["url"] for r in race_links]:
-                race_name = anchor.text.strip() or "IRONMAN Race"
-                race_links.append({"url": full_url, "name": race_name})
-
-    logging.info(f"Found {len(race_links)} race result links.")
-    return race_links
-
-def parse_race_results(race_info: Dict[str, str], whitelist: List[str]) -> List[Dict[str, Any]]:
-    url = race_info["url"]
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        if response.status_code != 200:
-            return []
-    except Exception as e:
-        logging.error(f"Error requesting {url}: {e}")
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    
-    h1_tag = soup.find("h1")
-    page_title = h1_tag.text.strip() if h1_tag else race_info["name"]
-    year_match = re.search(r"\b(19|20)\d{2}\b", page_title) or re.search(r"\b(19|20)\d{2}\b", url)
-    race_year = int(year_match.group(0)) if year_match else None
-    
-    results = []
-    table = soup.find("table")
-    if not table:
-        return []
-
-    rows = table.find_all("tr")
-    if len(rows) < 2:
-        return []
-
-    for row in rows[1:]:
-        try:
-            cols = [td.text.strip() for td in row.find_all(["td", "th"])]
-            if len(cols) < 3:
-                continue
-                
-            row_text = " ".join(cols).lower()
-            
-            is_hkg = "hkg" in row_text or "hong kong" in row_text
-            athlete_name = cols[0] if len(cols) > 0 else "Unknown"
-            is_whitelisted = athlete_name.lower() in whitelist
-
-            if is_hkg or is_whitelisted:
-                results.append({
-                    "athlete_name": athlete_name,
-                    "gender": cols[1] if len(cols) > 1 else "N/A",
-                    "age_group": cols[2] if len(cols) > 2 else "N/A",
-                    "swim_time": cols[3] if len(cols) > 3 else "N/A",
-                    "bike_time": cols[4] if len(cols) > 4 else "N/A",
-                    "run_time": cols[5] if len(cols) > 5 else "N/A",
-                    "total_time": cols[6] if len(cols) > 6 else cols[-1],
-                    "overall_rank": "N/A",
-                    "div_rank": "N/A",
-                    "race_name": page_title,
-                    "race_year": race_year,
-                    "source_url": url
-                })
-        except Exception as row_err:
-            logging.debug(f"Skipping row: {row_err}")
-            continue
-
-    return results
-
 def main():
     whitelist = load_whitelist()
-    race_links = get_race_links()
-    
     all_finishers = []
-    
-    for race in race_links:
-        race_results = parse_race_results(race, whitelist)
-        if race_results:
-            all_finishers.extend(race_results)
-        time.sleep(REQUEST_DELAY)
 
+    # Fetch index of races from CoachCox API endpoint
+    try:
+        index_url = f"{BASE_URL}/imstats/races/data/"
+        logging.info(f"Fetching race index from {index_url}")
+        res = requests.get(index_url, headers=HEADERS, timeout=20)
+        
+        if res.status_code == 200:
+            races = res.json()
+        else:
+            logging.warning("Index endpoint returned non-200, attempting fallbacks.")
+            races = []
+    except Exception as e:
+        logging.error(f"Error fetching index: {e}")
+        races = []
+
+    # Iterate over discovered or known major race IDs
+    for race in races:
+        race_id = race.get("id") or race.get("race_id")
+        if not race_id:
+            continue
+
+        data_url = f"{BASE_URL}/imstats/race/{race_id}/data/"
+        try:
+            r_res = requests.get(data_url, headers=HEADERS, timeout=15)
+            if r_res.status_code != 200:
+                continue
+
+            results = r_res.json()
+            for row in results:
+                row_str = json.dumps(row).lower()
+                athlete_name = row.get("name") or row.get("athlete", "Unknown")
+                
+                is_hkg = "hkg" in row_str or "hong kong" in row_str
+                is_whitelisted = athlete_name.lower() in whitelist
+
+                if is_hkg or is_whitelisted:
+                    all_finishers.append({
+                        "athlete_name": athlete_name,
+                        "gender": row.get("gender") or row.get("sex", "N/A"),
+                        "age_group": row.get("age_group") or row.get("category", "N/A"),
+                        "swim_time": row.get("swim", "N/A"),
+                        "bike_time": row.get("bike", "N/A"),
+                        "run_time": row.get("run", "N/A"),
+                        "total_time": row.get("overall") or row.get("total", "N/A"),
+                        "overall_rank": row.get("overall_rank", "N/A"),
+                        "div_rank": row.get("div_rank", "N/A"),
+                        "race_name": race.get("name", "IRONMAN Race"),
+                        "race_year": race.get("year"),
+                        "source_url": f"{BASE_URL}/imstats/race/{race_id}/results/"
+                    })
+            time.sleep(REQUEST_DELAY)
+        except Exception as err:
+            logging.debug(f"Error parsing race {race_id}: {err}")
+            continue
+
+    # Deduplicate entries
     deduped = {}
     for entry in all_finishers:
         key = f"{entry['athlete_name']}_{entry['race_name']}_{entry['total_time']}".lower()
         deduped[key] = entry
 
     final_results = list(deduped.values())
-    
+
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(final_results, f, indent=2, ensure_ascii=False)
 
-    logging.info(f"Successfully exported {len(final_results)} records to {OUTPUT_FILE}")
+    logging.info(f"Successfully saved {len(final_results)} HKG finishers to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
