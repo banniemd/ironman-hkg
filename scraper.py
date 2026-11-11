@@ -2,13 +2,14 @@ import os
 import json
 import logging
 import requests
+from bs4 import BeautifulSoup
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-SEARCH_URL = "https://www.coachcox.co.uk/imstats/search/data/"
+SEARCH_PAGE_URL = "https://www.coachcox.co.uk/imstats/search/"
 OUTPUT_FILE = "hkg_finishers.json"
 
 HEADERS = {
@@ -16,66 +17,58 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.coachcox.co.uk/imstats/search/"
+    )
 }
 
 def main():
-    payload = {
+    params = {
         "nationality": "Hong Kong",
         "type": "Ironman"
     }
     
-    logging.info(f"Querying CoachCox search endpoint for Hong Kong Ironman finishers...")
-    try:
-        response = requests.post(SEARCH_URL, data=payload, headers=HEADERS, timeout=20)
-        if response.status_code != 200:
-            logging.error(f"Search API returned status code {response.status_code}")
-            return
-        
-        data = response.json()
-        # Handle different potential JSON response structures (list or nested dict keys)
-        rows = data if isinstance(data, list) else data.get("data", data.get("results", []))
-        
-        logging.info(f"Retrieved {len(rows)} raw records from search API.")
-    except Exception as e:
-        logging.error(f"Failed to connect to CoachCox search API: {e}")
-        return
-
+    logging.info("Fetching results from CoachCox search page...")
     all_finishers = []
-    for row in rows:
-        athlete_name = row.get("name") or row.get("athlete", "Unknown")
-        race_name = row.get("race") or row.get("race_name", "IRONMAN Race")
+    
+    try:
+        response = requests.get(SEARCH_PAGE_URL, params=params, headers=HEADERS, timeout=20)
+        logging.info(f"Response Status Code: {response.status_code}")
         
-        all_finishers.append({
-            "athlete_name": athlete_name,
-            "gender": row.get("gender") or row.get("sex", "N/A"),
-            "age_group": row.get("division") or row.get("age_group", "N/A"),
-            "swim_time": row.get("swim_time") or row.get("swim", "N/A"),
-            "bike_time": row.get("bike_time") or row.get("bike", "N/A"),
-            "run_time": row.get("run_time") or row.get("run", "N/A"),
-            "total_time": row.get("overall_time") or row.get("total", "N/A"),
-            "overall_rank": str(row.get("overall_rank", "N/A")),
-            "div_rank": str(row.get("division_rank", row.get("div_rank", "N/A"))),
-            "race_name": race_name,
-            "race_year": row.get("year"),
-            "source_url": "https://www.coachcox.co.uk/imstats/search/"
-        })
-
-    # Deduplicate entries based on name, race, and total time
-    deduped = {}
-    for entry in all_finishers:
-        key = f"{entry['athlete_name']}_{entry['race_name']}_{entry['total_time']}".lower()
-        deduped[key] = entry
-
-    final_results = list(deduped.values())
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            table = soup.find("table")
+            
+            if table:
+                rows = table.find_all("tr")
+                logging.info(f"Found results table with {len(rows)} rows.")
+                
+                for row in rows[1:]: # Skip header row
+                    cols = [td.text.strip() for td in row.find_all(["td", "th"])]
+                    if len(cols) >= 9:
+                        all_finishers.append({
+                            "athlete_name": cols[0],
+                            "race_name": cols[1],
+                            "age_group": cols[2],
+                            "div_rank": cols[3],
+                            "total_time": cols[4],
+                            "overall_rank": cols[5],
+                            "swim_time": cols[6],
+                            "bike_time": cols[7],
+                            "run_time": cols[8],
+                            "gender": "M",
+                            "race_year": 2026,
+                            "source_url": SEARCH_PAGE_URL
+                        })
+            else:
+                logging.warning("No results table found on the page matching criteria.")
+        else:
+            logging.error(f"Page request failed with status {response.status_code}")
+    except Exception as e:
+        logging.error(f"Error scraping search page: {e}")
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(final_results, f, indent=2, ensure_ascii=False)
-
-    logging.info(f"Successfully saved {len(final_results)} HKG finishers to {OUTPUT_FILE}")
+        json.dump(all_finishers, f, indent=2, ensure_ascii=False)
+    
+    logging.info(f"Successfully wrote {len(all_finishers)} records to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
