@@ -1,13 +1,12 @@
-name: Monthly HKG IRONMAN Results Scraper
+name: Monthly HKG IRONMAN Results Generator
 
 on:
   schedule:
-    # Runs on the 1st day of every month at 02:00 UTC
     - cron: '0 2 1 * *'
-  workflow_dispatch: # Allows manual triggering from the GitHub UI
+  workflow_dispatch:
 
 jobs:
-  scrape-and-commit:
+  build-and-commit:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -21,12 +20,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
-
-      - name: Run Scraper Script
+      - name: Run Script
         run: python scraper.py
 
       - name: Commit and Push Updated Results
@@ -37,6 +31,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes detected in hkg_finishers.json."
           else
-            git commit -m "chore: automated monthly update of HKG ironman results [skip ci]"
+            git commit -m "chore: automated update of HKG ironman results [skip ci]"
             git push
           fi
