@@ -12,8 +12,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# Official Ironman results handler base configuration
-HANDLER_BASE_URL = "http://www.ironman.com/handlers/eventresults.aspx"
+BASE_URL = "https://www.coachcox.co.uk"
+LIST_URL = f"{BASE_URL}/imstats/races/"
 OUTPUT_FILE = "hkg_finishers.json"
 
 HEADERS = {
@@ -21,124 +21,103 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    )
 }
 
-def get_official_race_targets() -> List[Dict[str, str]]:
-    """
-    Discovers official Ironman event result links and dates directly from the official index.
-    """
-    directory_url = "https://www.ironman.com/results"
-    logging.info(f"Connecting to official Ironman results directory: {directory_url}")
-    
-    race_targets = []
+def get_all_race_links() -> List[Dict[str, str]]:
+    logging.info(f"Fetching master race directory from {LIST_URL}")
     try:
-        response = requests.get(directory_url, headers=HEADERS, timeout=25)
+        response = requests.get(LIST_URL, headers=HEADERS, timeout=20)
         if response.status_code != 200:
-            logging.error(f"Failed to reach official results page. Status: {response.status_code}")
+            logging.error(f"Failed to fetch master directory. Status: {response.status_code}")
             return []
-            
-        soup = BeautifulSoup(response.text, "html.parser")
-        # Find event result anchors or redirection links pointing to event results
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "eventresults.aspx" in href or "results" in href:
-                full_url = href if href.startswith("http") else f"https://www.ironman.com{href}"
-                if full_url not in [r["url"] for r in race_targets]:
-                    race_targets.append({"url": full_url, "name": a.text.strip() or "IRONMAN Event"})
     except Exception as e:
-        logging.error(f"Error connecting to official Ironman index: {e}")
-        
-    return race_targets
+        logging.error(f"Network error fetching master directory: {e}")
+        return []
 
-def parse_official_race_endpoint(event_url: str) -> List[Dict[str, Any]]:
-    """
-    Queries official event result tables, handling sex/age-group filters 
-    and extracting exact splits, transition times, and country codes.
-    """
-    hkg_athletes = []
+    soup = BeautifulSoup(response.text, "html.parser")
+    race_links = []
+    
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
+        if "/imstats/race/" in href:
+            clean_href = href.split("?")[0].rstrip("/") + "/results/"
+            full_url = BASE_URL + clean_href if clean_href.startswith("/") else clean_href
+            if full_url not in [r["url"] for r in race_links]:
+                race_name = anchor.text.strip() or "IRONMAN Race"
+                race_links.append({"url": full_url, "name": race_name})
+
+    logging.info(f"Discovered {len(race_links)} total historical race result pages to parse.")
+    return race_links
+
+def parse_race_page(race_info: Dict[str, str]) -> List[Dict[str, Any]]:
+    url = race_info["url"]
     try:
-        res = requests.get(event_url, headers=HEADERS, timeout=20)
-        if res.status_code != 200:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        if response.status_code != 200:
             return []
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    h1 = soup.find("h1")
+    page_title = h1.text.strip() if h1 else race_info["name"]
+    year_match = re.search(r"\b(19|20)\d{2}\b", page_title) or re.search(r"\b(19|20)\d{2}\b", url)
+    race_year = int(year_match.group(0)) if year_match else None
+    
+    results = []
+    table = soup.find("table")
+    if not table:
+        return []
+
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        return []
+
+    for row in rows[1:]:
+        cols = [td.text.strip() for td in row.find_all(["td", "th"])]
+        if len(cols) < 4:
+            continue
             
-        soup = BeautifulSoup(res.text, "html.parser")
+        row_text = " ".join(cols).lower()
         
-        # Extract event title and metadata
-        title_el = soup.select_one(".moduleContentInner header h1, #eventDetails h3.eventTitle")
-        race_name = title_el.text.strip() if title_el else "IRONMAN Race"
-        
-        year_match = re.search(r"\b(19|20)\d{2}\b", race_name) or re.search(r"\b(19|20)\d{2}\b", event_url)
-        race_year = int(year_match.group(0)) if year_match else 2026
-
-        # Locate results table
-        table = soup.select_one("table.eventResults, table")
-        if not table:
-            return []
-
-        rows = table.find_all("tr")
-        if len(rows) < 2:
-            return []
-
-        for row in rows[1:]:
-            cols = [td.get_text().strip() for td in row.find_all(["td", "th"])]
-            if len(cols) < 5:
-                continue
-                
-            row_text = " ".join(cols).lower()
+        # Check explicitly for Hong Kong country tags in the row
+        if "hkg" in row_text or "hong kong" in row_text:
+            times = re.findall(r"\b\d{1,2}:\d{2}:\d{2}\b", row_text)
             
-            # Explicit check for Hong Kong country code or representation string
-            if "hkg" in row_text or "hong kong" in row_text:
-                # Standard mapping for official columns:
-                # Name, Country, Div Rank, Gen Rank, Overall Rank, Swim, (T1/Bike/T2/Run depending on layout), Finish
-                athlete_name = cols[0] if len(cols) > 0 else "Unknown"
-                
-                # Extract time metrics matching HH:MM:SS format
-                times = re.findall(r"\b\d{1,2}:\d{2}:\d{2}\b", row_text)
-                
-                swim = times[0] if len(times) > 0 else "N/A"
-                bike = times[1] if len(times) > 1 else "N/A"
-                run = times[2] if len(times) > 2 else "N/A"
-                finish = times[3] if len(times) > 3 else (times[-1] if times else "N/A")
+            # Identify athlete name from text columns
+            text_cols = [c for c in cols[:3] if not c.isdigit() and len(c) > 2]
+            athlete_name = text_cols[0] if text_cols else cols[0]
 
-                # Extract gender and age category
-                gender = "M" if " m " in f" {row_text} " else ("F" if " f " in f" {row_text} " else "N/A")
-                age_group_match = re.search(r"\b[mp]\d{2}-\d{2}\b", row_text)
-                age_group = age_group_match.group(0).upper() if age_group_match else "N/A"
+            results.append({
+                "athlete_name": athlete_name,
+                "gender": "M" if " m " in f" {row_text} " else ("F" if " f " in f" {row_text} " else "N/A"),
+                "age_group": re.search(r"\b[mp]\d{2}-\d{2}\b", row_text).group(0).upper() if re.search(r"\b[mp]\d{2}-\d{2}\b", row_text) else "N/A",
+                "swim_time": times[0] if len(times) > 0 else "N/A",
+                "bike_time": times[1] if len(times) > 1 else "N/A",
+                "run_time": times[2] if len(times) > 2 else "N/A",
+                "total_time": times[3] if len(times) > 3 else (times[-1] if times else "N/A"),
+                "overall_rank": cols[5] if len(cols) > 5 and cols[5].isdigit() else "N/A",
+                "div_rank": cols[3] if len(cols) > 3 and cols[3].isdigit() else "N/A",
+                "race_name": page_title,
+                "race_year": race_year,
+                "source_url": url
+            })
 
-                hkg_athletes.append({
-                    "athlete_name": athlete_name,
-                    "gender": gender,
-                    "age_group": age_group,
-                    "swim_time": swim,
-                    "bike_time": bike,
-                    "run_time": run,
-                    "total_time": finish,
-                    "overall_rank": cols[4] if len(cols) > 4 and cols[4].isdigit() else "N/A",
-                    "div_rank": cols[2] if len(cols) > 2 and cols[2].isdigit() else "N/A",
-                    "race_name": race_name,
-                    "race_year": race_year,
-                    "source_url": event_url
-                })
-    except Exception as err:
-        logging.debug(f"Error parsing official endpoint {event_url}: {err}")
-        
-    return hkg_athletes
+    return results
 
 def main():
-    logging.info("Starting official Ironman results extraction...")
-    targets = get_official_race_targets()
-    
+    race_links = get_all_race_links()
     all_finishers = []
-    for target in targets:
-        results = parse_official_race_endpoint(target["url"])
-        if results:
-            all_finishers.extend(results)
-            logging.info(f"Captured {len(results)} HKG finisher(s) from {target['name']}")
-        time.sleep(1.0) # Polite request spacing
+    
+    for race in race_links:
+        match_results = parse_race_page(race)
+        if match_results:
+            all_finishers.extend(match_results)
+            logging.info(f"Found {len(match_results)} HKG finisher(s) in {race['name']}")
+        time.sleep(0.5) # Polite request delay
 
-    # Deduplicate entries based on name, race, and finish time
+    # Deduplicate entries
     deduped = {}
     for entry in all_finishers:
         key = f"{entry['athlete_name']}_{entry['race_name']}_{entry['total_time']}".lower()
@@ -149,7 +128,7 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(final_results, f, indent=2, ensure_ascii=False)
 
-    logging.info(f"Successfully compiled {len(final_results)} official HKG records to {OUTPUT_FILE}")
+    logging.info(f"Successfully compiled {len(final_results)} total HKG records to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
