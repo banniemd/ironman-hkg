@@ -1,6 +1,9 @@
 import os
 import json
+import time
 import logging
+import re
+from typing import List, Dict, Any
 import requests
 from bs4 import BeautifulSoup
 
@@ -9,7 +12,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-SEARCH_PAGE_URL = "https://www.coachcox.co.uk/imstats/search/"
+BASE_URL = "https://www.coachcox.co.uk"
+LIST_URL = f"{BASE_URL}/imstats/races/"
 OUTPUT_FILE = "hkg_finishers.json"
 
 HEADERS = {
@@ -20,55 +24,110 @@ HEADERS = {
     )
 }
 
-def main():
-    params = {
-        "nationality": "Hong Kong",
-        "type": "Ironman"
-    }
+def get_race_links() -> List[Dict[str, str]]:
+    logging.info(f"Fetching master race directory from {LIST_URL}")
+    try:
+        response = requests.get(LIST_URL, headers=HEADERS, timeout=20)
+        if response.status_code != 200:
+            return []
+    except Exception as e:
+        logging.error(f"Error fetching race list: {e}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    race_links = []
     
-    logging.info("Fetching results from CoachCox search page...")
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
+        if "/imstats/race/" in href:
+            clean_href = href.split("?")[0].rstrip("/") + "/results/"
+            full_url = BASE_URL + clean_href if clean_href.startswith("/") else clean_href
+            if full_url not in [r["url"] for r in race_links]:
+                race_name = anchor.text.strip() or "IRONMAN Race"
+                race_links.append({"url": full_url, "name": race_name})
+
+    logging.info(f"Discovered {len(race_links)} total race result pages to parse.")
+    return race_links
+
+def parse_race_results(race_info: Dict[str, str]) -> List[Dict[str, Any]]:
+    url = race_info["url"]
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        if response.status_code != 200:
+            return []
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    h1 = soup.find("h1")
+    page_title = h1.text.strip() if h1 else race_info["name"]
+    year_match = re.search(r"\b(19|20)\d{2}\b", page_title) or re.search(r"\b(19|20)\d{2}\b", url)
+    race_year = int(year_match.group(0)) if year_match else None
+    
+    results = []
+    table = soup.find("table")
+    if not table:
+        return []
+
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        return []
+
+    for row in rows[1:]:
+        cols = [td.text.strip() for td in row.find_all(["td", "th"])]
+        if len(cols) < 4:
+            continue
+            
+        row_text = " ".join(cols).lower()
+        
+        # Explicit check for Hong Kong nationality indicators in the row data
+        if "hkg" in row_text or "hong kong" in row_text:
+            times = re.findall(r"\b\d{1,2}:\d{2}:\d{2}\b", row_text)
+            
+            # Find the athlete name (typically text columns before splits/ranks)
+            text_cols = [c for c in cols[:3] if not c.isdigit() and len(c) > 2]
+            athlete_name = text_cols[0] if text_cols else cols[0]
+
+            results.append({
+                "athlete_name": athlete_name,
+                "gender": "M" if " m " in f" {row_text} " else ("F" if " f " in f" {row_text} " else "N/A"),
+                "age_group": re.search(r"\b[mp]\d{2}-\d{2}\b", row_text).group(0).upper() if re.search(r"\b[mp]\d{2}-\d{2}\b", row_text) else "N/A",
+                "swim_time": times[0] if len(times) > 0 else "N/A",
+                "bike_time": times[1] if len(times) > 1 else "N/A",
+                "run_time": times[2] if len(times) > 2 else "N/A",
+                "total_time": times[3] if len(times) > 3 else (times[-1] if times else "N/A"),
+                "overall_rank": "N/A",
+                "div_rank": "N/A",
+                "race_name": page_title,
+                "race_year": race_year,
+                "source_url": url
+            })
+
+    return results
+
+def main():
+    race_links = get_race_links()
     all_finishers = []
     
-    try:
-        response = requests.get(SEARCH_PAGE_URL, params=params, headers=HEADERS, timeout=20)
-        logging.info(f"Response Status Code: {response.status_code}")
-        
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            table = soup.find("table")
-            
-            if table:
-                rows = table.find_all("tr")
-                logging.info(f"Found results table with {len(rows)} rows.")
-                
-                for row in rows[1:]: # Skip header row
-                    cols = [td.text.strip() for td in row.find_all(["td", "th"])]
-                    if len(cols) >= 9:
-                        all_finishers.append({
-                            "athlete_name": cols[0],
-                            "race_name": cols[1],
-                            "age_group": cols[2],
-                            "div_rank": cols[3],
-                            "total_time": cols[4],
-                            "overall_rank": cols[5],
-                            "swim_time": cols[6],
-                            "bike_time": cols[7],
-                            "run_time": cols[8],
-                            "gender": "M",
-                            "race_year": 2026,
-                            "source_url": SEARCH_PAGE_URL
-                        })
-            else:
-                logging.warning("No results table found on the page matching criteria.")
-        else:
-            logging.error(f"Page request failed with status {response.status_code}")
-    except Exception as e:
-        logging.error(f"Error scraping search page: {e}")
+    for idx, race in enumerate(race_links):
+        match_results = parse_race_results(race)
+        if match_results:
+            all_finishers.extend(match_results)
+            logging.info(f"Found {len(match_results)} HKG finisher(s) in {race['name']}")
+        time.sleep(1.0) # Polite rate-limiting
+
+    # Deduplicate entries
+    deduped = {}
+    for entry in all_finishers:
+        key = f"{entry['athlete_name']}_{entry['race_name']}_{entry['total_time']}".lower()
+        deduped[key] = entry
+
+    final_results = list(deduped.values())
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_finishers, f, indent=2, ensure_ascii=False)
-    
-    logging.info(f"Successfully wrote {len(all_finishers)} records to {OUTPUT_FILE}")
+        json.dump(final_results, f, indent=2, ensure_ascii=False)
+
+    logging.info(f"Successfully compiled {len(final_results)} total HKG finishers to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
